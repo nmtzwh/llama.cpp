@@ -317,6 +317,7 @@ struct cmd_params {
     std::vector<std::string>         hf_file;
     std::string                      hf_token;
     std::string                      prompt_text;
+    bool                             prompt_text_exact;
     std::vector<int>                 n_prompt;
     std::vector<int>                 n_gen;
     std::vector<std::pair<int, int>> n_pg;
@@ -363,6 +364,7 @@ static const cmd_params cmd_params_defaults = {
     /* hf_file              */ {},
     /* hf_token             */ "",
     /* prompt_text          */ "",
+    /* prompt_text_exact    */ false,
     /* n_prompt             */ { 512 },
     /* n_gen                */ { 128 },
     /* n_pg                 */ {},
@@ -435,7 +437,9 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -hft, --hf-token <token>                    Hugging Face access token\n");
     printf("                                              (default: value from HF_TOKEN environment variable)\n");
     printf("  --prompt-text <text>                        use tokenized text instead of synthetic random prompt tokens\n");
-    printf("                                              repeated as needed to reach n_prompt / n_depth; tokenization is excluded from timing\n");
+    printf("                                              if -p is omitted, prompt tests use the exact tokenized text length;\n");
+    printf("                                              if -p is provided, the text is repeated or truncated to match it.\n");
+    printf("                                              tokenization is excluded from timing\n");
     printf("  -p, --n-prompt <n>                          (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
     printf("  -n, --n-gen <n>                             (default: %s)\n", join(cmd_params_defaults.n_gen, ",").c_str());
     printf("  -pg <pp,tg>                                 (default: %s)\n", join(transform_to_str(cmd_params_defaults.n_pg, pair_str), ",").c_str());
@@ -517,6 +521,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.prompt_text_exact    = cmd_params_defaults.prompt_text_exact;
+
+    bool has_explicit_n_prompt  = false;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -572,6 +579,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_prompt.insert(params.n_prompt.end(), p.begin(), p.end());
+                has_explicit_n_prompt = true;
             } else if (arg == "-n" || arg == "--n-gen") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1133,12 +1141,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
     }
 
+    if (!params.prompt_text.empty() && !has_explicit_n_prompt) {
+        params.prompt_text_exact = true;
+    }
+
     return params;
 }
 
 struct cmd_params_instance {
     std::string        model;
     std::string        prompt_text;
+    bool               prompt_text_exact;
     int                n_prompt;
     int                n_gen;
     int                n_depth;
@@ -1288,6 +1301,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             cmd_params_instance instance = {
                 /* .model        = */ m,
                 /* .prompt_text  = */ params.prompt_text,
+                /* .prompt_text_exact = */ params.prompt_text_exact,
                 /* .n_prompt     = */ n_prompt,
                 /* .n_gen        = */ 0,
                 /* .n_depth      = */ nd,
@@ -1327,6 +1341,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             cmd_params_instance instance = {
                 /* .model        = */ m,
                 /* .prompt_text  = */ params.prompt_text,
+                /* .prompt_text_exact = */ params.prompt_text_exact,
                 /* .n_prompt     = */ 0,
                 /* .n_gen        = */ n_gen,
                 /* .n_depth      = */ nd,
@@ -1366,6 +1381,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
             cmd_params_instance instance = {
                 /* .model        = */ m,
                 /* .prompt_text  = */ params.prompt_text,
+                /* .prompt_text_exact = */ params.prompt_text_exact,
                 /* .n_prompt     = */ n_pg.first,
                 /* .n_gen        = */ n_pg.second,
                 /* .n_depth      = */ nd,
@@ -1449,7 +1465,7 @@ struct test {
         gpu_info(get_gpu_info()) {
 
         model_filename = inst.model;
-        prompt_source  = inst.prompt_text.empty() ? "synthetic" : "text";
+        prompt_source  = inst.prompt_text.empty() ? "synthetic" : (inst.prompt_text_exact ? "text-exact" : "text");
         char buf[128];
         llama_model_desc(lmodel, buf, sizeof(buf));
         model_type     = buf;
@@ -2130,6 +2146,14 @@ static std::vector<llama_token> build_text_prompt_tokens(llama_context * ctx, co
     return tokens;
 }
 
+static std::vector<llama_token> tokenize_prompt_text_exact(const llama_vocab * vocab, const std::string & prompt_text) {
+    auto tokens = common_tokenize(vocab, prompt_text, true, true);
+    if (tokens.empty()) {
+        throw std::runtime_error("prompt text tokenized to zero tokens");
+    }
+    return tokens;
+}
+
 static bool test_prompt_embd(
         llama_context * ctx,
         int n_prompt,
@@ -2392,6 +2416,12 @@ int main(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
+        std::vector<llama_token> exact_prompt_tokens;
+        if (!inst.prompt_text.empty() && inst.prompt_text_exact && inst.n_prompt > 0) {
+            exact_prompt_tokens = tokenize_prompt_text_exact(llama_model_get_vocab(lmodel), inst.prompt_text);
+            cparams.n_ctx = std::max<uint32_t>(cparams.n_ctx, exact_prompt_tokens.size() + inst.n_gen + inst.n_depth);
+        }
+
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
@@ -2400,11 +2430,18 @@ int main(int argc, char ** argv) {
         }
 
         test t(inst, lmodel, ctx);
+        if (!exact_prompt_tokens.empty()) {
+            t.n_prompt = exact_prompt_tokens.size();
+        }
 
         std::map<int, std::vector<llama_token>> prompt_tokens_cache;
         auto get_prompt_tokens = [&](int n_tokens) -> const std::vector<llama_token> * {
             if (inst.prompt_text.empty() || n_tokens <= 0) {
                 return nullptr;
+            }
+
+            if (inst.prompt_text_exact && n_tokens == (int) exact_prompt_tokens.size()) {
+                return &exact_prompt_tokens;
             }
 
             auto it = prompt_tokens_cache.find(n_tokens);

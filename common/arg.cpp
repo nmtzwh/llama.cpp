@@ -2783,6 +2783,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--embd-clear-memory"},
+        {"--no-embd-clear-memory"},
+        string_format("whether to clear memory before each embedding batch (default: %s)", params.embd_clear_memory ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.embd_clear_memory = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
+    add_opt(common_arg(
         {"--embd-output-format"}, "FORMAT",
         "empty = default, \"array\" = [[],[]...], \"json\" = openai style, \"json+\" = same \"json\" + cosine similarity matrix, \"raw\" = plain whitespace-delimited output (one embedding per line)",
         [](common_params & params, const std::string & value) {

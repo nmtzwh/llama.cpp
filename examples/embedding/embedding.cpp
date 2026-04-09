@@ -34,11 +34,13 @@ static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & toke
     }
 }
 
-static void batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm) {
+static void batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm, bool clear_memory) {
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
 
     // clear previous kv_cache values (irrelevant for embeddings)
-    llama_memory_clear(llama_get_memory(ctx), true);
+    if (clear_memory) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+    }
 
     // run model
     LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
@@ -106,6 +108,10 @@ int main(int argc, char ** argv) {
     }
 
     params.embedding = true;
+
+    if (!params.embd_clear_memory) {
+        LOG_WRN("%s: memory clearing is disabled; this is intended for profiling and can change embedding behavior across batches\n", __func__);
+    }
 
     // get max number of sequences per batch
     const int n_seq_max = llama_max_parallel_sequences();
@@ -271,7 +277,7 @@ int main(int argc, char ** argv) {
         // encode if at capacity
         if (batch.n_tokens + n_toks > n_batch || s >= n_seq_max) {
             float * out = emb + e * n_embd_out;
-            batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize);
+            batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize, params.embd_clear_memory);
             e += pooling_type == LLAMA_POOLING_TYPE_NONE ? batch.n_tokens : s;
             s = 0;
             common_batch_clear(batch);
@@ -284,7 +290,7 @@ int main(int argc, char ** argv) {
 
     // final batch
     float * out = emb + e * n_embd_out;
-    batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize);
+    batch_decode(ctx, batch, out, s, n_embd_out, params.embd_normalize, params.embd_clear_memory);
 
     if (params.embd_out.empty()) {
         LOG("\n");

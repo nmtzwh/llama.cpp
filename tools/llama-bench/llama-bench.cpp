@@ -1511,6 +1511,10 @@ struct test {
 
     uint64_t stdev_ns() const { return ::stdev(samples_ns); }
 
+    double avg_ms() const { return avg_ns() / 1e6; }
+
+    double stdev_ms() const { return stdev_ns() / 1e6; }
+
     std::vector<double> get_ts() const {
         int                 n_tokens = n_prompt + n_gen;
         std::vector<double> ts;
@@ -1556,7 +1560,8 @@ struct test {
             "embd_clear_memory",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
-            "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
+            "test_time",      "avg_ns",         "stddev_ns",     "avg_ms",         "stddev_ms",
+            "avg_ts",         "stddev_ts"
         };
         return fields;
     }
@@ -1575,7 +1580,7 @@ struct test {
             field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "embd_clear_memory" || field == "no_host") {
             return BOOL;
         }
-        if (field == "avg_ts" || field == "stddev_ts") {
+        if (field == "avg_ms" || field == "stddev_ms" || field == "avg_ts" || field == "stddev_ts") {
             return FLOAT;
         }
         return STRING;
@@ -1659,6 +1664,8 @@ struct test {
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
+                                            std::to_string(avg_ms()),
+                                            std::to_string(stdev_ms()),
                                             std::to_string(avg_ts()),
                                             std::to_string(stdev_ts()) };
         return values;
@@ -1804,6 +1811,9 @@ struct markdown_printer : public printer {
         }
         if (field == "prompt_source") {
             return -8;
+        }
+        if (field == "ms") {
+            return 16;
         }
         if (field == "t/s") {
             return 20;
@@ -2002,7 +2012,7 @@ struct markdown_printer : public printer {
             fields.emplace_back("fit_min_ctx");
         }
         fields.emplace_back("test");
-        fields.emplace_back("t/s");
+        fields.emplace_back("ms");
 
         fprintf(fout, "|");
         for (const auto & field : fields) {
@@ -2055,8 +2065,8 @@ struct markdown_printer : public printer {
                     snprintf(buf + len, sizeof(buf) - len, " @ d%d", t.n_depth);
                 }
                 value = buf;
-            } else if (field == "t/s") {
-                snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
+            } else if (field == "ms") {
+                snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ms(), t.stdev_ms());
                 value = buf;
             } else if (vmap.find(field) != vmap.end()) {
                 value = vmap.at(field);
@@ -2066,7 +2076,7 @@ struct markdown_printer : public printer {
             }
 
             int width = get_field_width(field);
-            if (field == "t/s") {
+            if (field == "t/s" || field == "ms") {
                 // HACK: the utf-8 character is 2 bytes
                 width += 1;
             }

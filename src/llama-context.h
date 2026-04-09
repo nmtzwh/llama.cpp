@@ -9,7 +9,9 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <cstdint>
 #include <map>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -170,7 +172,10 @@ struct llama_context {
     //
 
     llama_perf_context_data perf_get_data() const;
+    int64_t perf_get_prompt_encode_us() const;
+    int32_t perf_get_prompt_encode_tokens() const;
     void perf_reset();
+    void perf_layer_timing_print() const;
 
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> memory_breakdown() const;
 
@@ -235,6 +240,14 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    static bool perf_eval_callback(struct ggml_tensor * t, bool ask, void * user_data);
+
+    bool perf_eval_callback_impl(struct ggml_tensor * t, bool ask);
+    bool perf_layer_timing_should_observe(const struct ggml_tensor * t) const;
+    void perf_layer_timing_observe(const struct ggml_tensor * t);
+    void perf_layer_timing_begin();
+    void perf_layer_timing_commit();
+    void perf_layer_timing_reset_current();
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -346,14 +359,33 @@ private:
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;
+    mutable int64_t t_p_encode_us = 0;
     mutable int64_t t_p_eval_us = 0;
     mutable int64_t t_eval_us   = 0;
 
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
+    mutable int32_t n_p_encode = 0; // number of tokens in prompt-processing calls that used encode()
     mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    bool perf_layer_timing_enabled = false;
+    bool perf_layer_timing_active = false;
+    bool perf_layer_timing_finalized = false;
+    bool perf_current_is_encode = false;
+    int64_t perf_layer_graph_n_tokens = 0;
+    bool perf_layer_graph_is_encode = false;
+    mutable int64_t perf_layer_graph_start_us = 0;
+    mutable int64_t perf_layer_last_us = 0;
+    mutable int64_t perf_layer_result_us = 0;
+    mutable std::vector<int64_t> perf_layer_curr_us;
+    mutable std::vector<int64_t> perf_p_encode_layer_us;
+    mutable std::vector<int64_t> perf_p_eval_layer_us;
+    mutable std::vector<int64_t> perf_eval_layer_us;
+    mutable int64_t perf_p_encode_result_us = 0;
+    mutable int64_t perf_p_eval_result_us = 0;
+    mutable int64_t perf_eval_result_us = 0;
 };

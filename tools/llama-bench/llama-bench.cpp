@@ -354,6 +354,9 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             n_batch_explicit;
+    bool                             n_ubatch_explicit;
+    bool                             flash_attn_explicit;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -401,6 +404,9 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* n_batch_explicit     */ false,
+    /* n_ubatch_explicit    */ false,
+    /* flash_attn_explicit  */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -522,6 +528,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.prompt_text_exact    = cmd_params_defaults.prompt_text_exact;
+    params.n_batch_explicit     = cmd_params_defaults.n_batch_explicit;
+    params.n_ubatch_explicit    = cmd_params_defaults.n_ubatch_explicit;
+    params.flash_attn_explicit  = cmd_params_defaults.flash_attn_explicit;
 
     bool has_explicit_n_prompt  = false;
 
@@ -612,6 +621,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_batch.insert(params.n_batch.end(), p.begin(), p.end());
+                params.n_batch_explicit = true;
             } else if (arg == "-ub" || arg == "--ubatch-size") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -619,6 +629,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_ubatch.insert(params.n_ubatch.end(), p.begin(), p.end());
+                params.n_ubatch_explicit = true;
             } else if (arg == "-ctk" || arg == "--cache-type-k") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -811,6 +822,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.flash_attn.insert(params.flash_attn.end(), p.begin(), p.end());
+                params.flash_attn_explicit = true;
             } else if (arg == "-mmp" || arg == "--mmap") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1180,6 +1192,9 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    bool               n_batch_explicit;
+    bool               n_ubatch_explicit;
+    bool               flash_attn_explicit;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1262,6 +1277,38 @@ struct cmd_params_instance {
     }
 };
 
+static void align_embedding_context_with_example(
+        const cmd_params_instance & inst,
+        const llama_model * model,
+        llama_context_params & cparams,
+        const std::vector<llama_token> * exact_prompt_tokens) {
+    if (!inst.embeddings) {
+        return;
+    }
+
+    cparams.kv_unified = true;
+    cparams.n_seq_max = llama_max_parallel_sequences();
+
+    if (!inst.flash_attn_explicit) {
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    }
+
+    const uint32_t model_n_ctx = llama_model_n_ctx_train(model);
+    uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
+    if (exact_prompt_tokens) {
+        n_ctx_needed = std::max<uint32_t>(n_ctx_needed, exact_prompt_tokens->size() + inst.n_gen + inst.n_depth);
+    }
+    cparams.n_ctx = std::max(model_n_ctx, n_ctx_needed);
+
+    if (!inst.n_batch_explicit && cparams.n_batch < cparams.n_ctx) {
+        cparams.n_batch = cparams.n_ctx;
+    }
+
+    if (!inst.n_ubatch_explicit) {
+        cparams.n_ubatch = cparams.n_batch;
+    }
+}
+
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
     std::vector<cmd_params_instance> instances;
 
@@ -1330,6 +1377,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .n_batch_explicit = */ params.n_batch_explicit,
+                /* .n_ubatch_explicit = */ params.n_ubatch_explicit,
+                /* .flash_attn_explicit = */ params.flash_attn_explicit,
             };
             instances.push_back(instance);
         }
@@ -1370,6 +1420,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .n_batch_explicit = */ params.n_batch_explicit,
+                /* .n_ubatch_explicit = */ params.n_ubatch_explicit,
+                /* .flash_attn_explicit = */ params.flash_attn_explicit,
             };
             instances.push_back(instance);
         }
@@ -1410,6 +1463,9 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .n_batch_explicit = */ params.n_batch_explicit,
+                /* .n_ubatch_explicit = */ params.n_ubatch_explicit,
+                /* .flash_attn_explicit = */ params.flash_attn_explicit,
             };
             instances.push_back(instance);
         }
@@ -1471,8 +1527,8 @@ struct test {
         model_type     = buf;
         model_size     = llama_model_size(lmodel);
         model_n_params = llama_model_n_params(lmodel);
-        n_batch        = inst.n_batch;
-        n_ubatch       = inst.n_ubatch;
+        n_batch        = llama_n_batch(ctx);
+        n_ubatch       = llama_n_ubatch(ctx);
         n_threads      = inst.n_threads;
         cpu_mask       = inst.cpu_mask;
         cpu_strict     = inst.cpu_strict;
@@ -2135,6 +2191,8 @@ struct ctx_state {
     std::vector<uint8_t> buf; // the llama_context state buffer
 };
 
+struct cmd_params_instance;
+
 static std::vector<llama_token> build_text_prompt_tokens(llama_context * ctx, const std::string & prompt_text, int n_prompt) {
     GGML_ASSERT(n_prompt > 0);
 
@@ -2162,6 +2220,11 @@ static std::vector<llama_token> tokenize_prompt_text_exact(const llama_vocab * v
         throw std::runtime_error("prompt text tokenized to zero tokens");
     }
     return tokens;
+}
+
+static bool bench_layer_timing_requested() {
+    const char * env = getenv("LLAMA_PERF_LAYER_TIMING");
+    return env != nullptr && atoi(env) != 0;
 }
 
 static bool test_prompt_embd(
@@ -2379,6 +2442,13 @@ int main(int argc, char ** argv) {
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
 
+        // llama-bench normally leaves libllama internal perf counters disabled.
+        // Enable them when verbose reporting or layer timing is requested so the
+        // prompt encode/decode breakdown is available for comparison.
+        if (params.verbose || bench_layer_timing_requested()) {
+            cparams.no_perf = false;
+        }
+
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
 
@@ -2429,8 +2499,10 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> exact_prompt_tokens;
         if (!inst.prompt_text.empty() && inst.prompt_text_exact && inst.n_prompt > 0) {
             exact_prompt_tokens = tokenize_prompt_text_exact(llama_model_get_vocab(lmodel), inst.prompt_text);
-            cparams.n_ctx = std::max<uint32_t>(cparams.n_ctx, exact_prompt_tokens.size() + inst.n_gen + inst.n_depth);
         }
+
+        align_embedding_context_with_example(inst, lmodel, cparams,
+                exact_prompt_tokens.empty() ? nullptr : &exact_prompt_tokens);
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {

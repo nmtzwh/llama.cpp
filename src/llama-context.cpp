@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 //
 // llama_context
@@ -33,6 +34,18 @@ llama_context::llama_context(
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
+    {
+        const char * LLAMA_PERF_LAYER_TIMING = getenv("LLAMA_PERF_LAYER_TIMING");
+        perf_layer_timing_enabled = LLAMA_PERF_LAYER_TIMING && atoi(LLAMA_PERF_LAYER_TIMING) != 0;
+        if (perf_layer_timing_enabled) {
+            perf_layer_curr_us.resize(model.hparams.n_layer);
+            perf_p_encode_layer_us.resize(model.hparams.n_layer);
+            perf_p_eval_layer_us.resize(model.hparams.n_layer);
+            perf_eval_layer_us.resize(model.hparams.n_layer);
+            LLAMA_LOG_INFO("%s: detailed layer timing enabled\n", __func__);
+        }
+    }
+
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
@@ -49,6 +62,9 @@ llama_context::llama_context(
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
+    if (perf_layer_timing_enabled) {
+        cparams.no_perf = false;
+    }
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
 
@@ -640,15 +656,30 @@ void llama_context::synchronize() {
 
     // add the evaluation to the stats
     if (n_queued_tokens == 1) {
-        if (!cparams.no_perf) {
+        if (!perf_layer_timing_finalized && !cparams.no_perf) {
             t_eval_us += ggml_time_us() - t_compute_start_us;
+        }
+        if (!perf_layer_timing_finalized) {
+            perf_layer_timing_commit();
         }
         n_eval++;
     } else if (n_queued_tokens > 1) {
-        if (!cparams.no_perf) {
-            t_p_eval_us += ggml_time_us() - t_compute_start_us;
+        const bool is_encode = perf_current_is_encode || memory == nullptr;
+        if (!perf_layer_timing_finalized && !cparams.no_perf) {
+            if (is_encode) {
+                t_p_encode_us += ggml_time_us() - t_compute_start_us;
+            } else {
+                t_p_eval_us += ggml_time_us() - t_compute_start_us;
+            }
         }
-        n_p_eval += n_queued_tokens;
+        if (is_encode) {
+            n_p_encode += n_queued_tokens;
+        } else {
+            n_p_eval += n_queued_tokens;
+        }
+        if (!perf_layer_timing_finalized) {
+            perf_layer_timing_commit();
+        }
     }
 
     // get a more accurate load time, upon first eval
@@ -659,6 +690,9 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+    perf_current_is_encode = false;
+    perf_layer_timing_finalized = false;
+    perf_layer_timing_reset_current();
 }
 
 const llama_model & llama_context::get_model() const {
@@ -1193,7 +1227,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback(
+                sched.get(),
+                (perf_layer_timing_enabled || cparams.cb_eval) ? llama_context::perf_eval_callback : nullptr,
+                (perf_layer_timing_enabled || cparams.cb_eval) ? this : nullptr);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1264,16 +1301,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
-    if (t_compute_start_us == 0) {
-        t_compute_start_us = ggml_time_us();
-    }
-
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
 
     sched_reserve();
-
-    n_queued_tokens += n_tokens;
 
     // reserve output buffer
     if (output_reserve(n_tokens) < n_tokens) {
@@ -1286,6 +1317,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
     }
 
     n_outputs = n_tokens;
+
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+
+    n_queued_tokens += n_tokens;
+    perf_current_is_encode = true;
 
     const auto causal_attn_org = cparams.causal_attn;
 
@@ -1300,6 +1338,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = causal_attn_org;
 
     if (!res) {
+        perf_current_is_encode = false;
         switch (status) {
             case GGML_STATUS_ABORTED:      return  2;
             case GGML_STATUS_ALLOC_FAILED: return -2;
@@ -1596,11 +1635,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
-    if (t_compute_start_us == 0) {
-        t_compute_start_us = ggml_time_us();
-    }
-    n_queued_tokens += n_tokens_all;
-
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
     output_swaps.clear();
@@ -1662,6 +1696,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    if (t_compute_start_us == 0) {
+        t_compute_start_us = ggml_time_us();
+    }
+    perf_current_is_encode = false;
+    n_queued_tokens += n_tokens_all;
 
     int64_t n_outputs_prev = 0;
 
@@ -2184,9 +2224,17 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    ggml_backend_sched_set_eval_callback(
+            sched.get(),
+            (perf_layer_timing_enabled || cparams.cb_eval) ? llama_context::perf_eval_callback : nullptr,
+            (perf_layer_timing_enabled || cparams.cb_eval) ? this : nullptr);
+
+    perf_layer_timing_begin();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+        perf_layer_timing_reset_current();
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -2218,6 +2266,194 @@ llm_graph_cb llama_context::graph_get_cb() const {
             }
         }
     };
+}
+
+bool llama_context::perf_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    return ctx->perf_eval_callback_impl(t, ask);
+}
+
+bool llama_context::perf_eval_callback_impl(struct ggml_tensor * t, bool ask) {
+    const bool observe = perf_layer_timing_enabled && perf_layer_timing_should_observe(t);
+
+    if (ask) {
+        if (perf_layer_timing_enabled) {
+            return true;
+        }
+        return cparams.cb_eval ? cparams.cb_eval(t, true, cparams.cb_eval_user_data) : false;
+    }
+
+    if (observe) {
+        perf_layer_timing_observe(t);
+    } else if (perf_layer_timing_enabled && !ask) {
+        const std::string name = ggml_get_name(t);
+        if (!name.empty() && perf_layer_timing_active && perf_layer_last_us == perf_layer_graph_start_us) {
+            perf_layer_last_us = ggml_time_us();
+        }
+    }
+
+    return cparams.cb_eval ? cparams.cb_eval(t, false, cparams.cb_eval_user_data) : true;
+}
+
+bool llama_context::perf_layer_timing_should_observe(const ggml_tensor * t) const {
+    if (!t) {
+        return false;
+    }
+
+    const std::string name = ggml_get_name(t);
+    if (name.empty()) {
+        return false;
+    }
+
+    if (name.rfind("l_out-", 0) == 0) {
+        return true;
+    }
+
+    return name.rfind("result_", 0) == 0 || name == "result_norm";
+}
+
+void llama_context::perf_layer_timing_observe(const ggml_tensor * t) {
+    if (!perf_layer_timing_active || !t) {
+        return;
+    }
+
+    const int64_t now_us = ggml_time_us();
+    const int64_t delta_us = std::max<int64_t>(0, now_us - perf_layer_last_us);
+    perf_layer_last_us = now_us;
+
+    const std::string name = ggml_get_name(t);
+    if (name.rfind("l_out-", 0) == 0) {
+        const auto dash = name.find_last_of('-');
+        if (dash != std::string::npos) {
+            const int layer = std::stoi(name.substr(dash + 1));
+            if (layer >= 0 && layer < (int) perf_layer_curr_us.size()) {
+                perf_layer_curr_us[layer] += delta_us;
+            }
+        }
+        return;
+    }
+
+    if (name.rfind("result_", 0) == 0 || name == "result_norm") {
+        perf_layer_result_us += delta_us;
+    }
+
+    const bool finalize =
+            name.rfind("result_", 0) == 0 ||
+            (name == "result_norm" && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE);
+
+    if (!finalize) {
+        return;
+    }
+
+    const int64_t graph_n_tokens = perf_layer_graph_n_tokens;
+    const bool is_encode = graph_n_tokens > 1 && perf_layer_graph_is_encode;
+    auto & dst = graph_n_tokens == 1 ? perf_eval_layer_us : (is_encode ? perf_p_encode_layer_us : perf_p_eval_layer_us);
+    for (size_t i = 0; i < perf_layer_curr_us.size(); ++i) {
+        dst[i] += perf_layer_curr_us[i];
+    }
+
+    if (graph_n_tokens == 1) {
+        perf_eval_result_us += perf_layer_result_us;
+    } else if (graph_n_tokens > 1 && is_encode) {
+        perf_p_encode_result_us += perf_layer_result_us;
+    } else if (graph_n_tokens > 1) {
+        perf_p_eval_result_us += perf_layer_result_us;
+    }
+
+    if (!cparams.no_perf && perf_layer_graph_start_us > 0) {
+        const int64_t graph_us = std::max<int64_t>(0, now_us - perf_layer_graph_start_us);
+        if (graph_n_tokens == 1) {
+            t_eval_us += graph_us;
+        } else if (is_encode) {
+            t_p_encode_us += graph_us;
+        } else {
+            t_p_eval_us += graph_us;
+        }
+    }
+
+    perf_layer_timing_finalized = true;
+    perf_layer_timing_reset_current();
+}
+
+void llama_context::perf_layer_timing_begin() {
+    if (!perf_layer_timing_enabled) {
+        return;
+    }
+
+    if (!perf_layer_timing_active) {
+        perf_layer_timing_active = true;
+        perf_layer_timing_finalized = false;
+        perf_layer_graph_n_tokens = n_queued_tokens;
+        perf_layer_graph_is_encode = perf_current_is_encode || memory == nullptr;
+        perf_layer_graph_start_us = ggml_time_us();
+        perf_layer_last_us = perf_layer_graph_start_us;
+        std::fill(perf_layer_curr_us.begin(), perf_layer_curr_us.end(), 0);
+        perf_layer_result_us = 0;
+    }
+}
+
+void llama_context::perf_layer_timing_commit() {
+    if (!perf_layer_timing_enabled || !perf_layer_timing_active) {
+        return;
+    }
+
+    const int64_t graph_n_tokens = perf_layer_graph_n_tokens;
+    const bool is_encode = graph_n_tokens > 1 && perf_layer_graph_is_encode;
+    auto & dst = graph_n_tokens == 1 ? perf_eval_layer_us : (is_encode ? perf_p_encode_layer_us : perf_p_eval_layer_us);
+    for (size_t i = 0; i < perf_layer_curr_us.size(); ++i) {
+        dst[i] += perf_layer_curr_us[i];
+    }
+
+    if (graph_n_tokens == 1) {
+        perf_eval_result_us += perf_layer_result_us;
+    } else if (graph_n_tokens > 1 && is_encode) {
+        perf_p_encode_result_us += perf_layer_result_us;
+    } else if (graph_n_tokens > 1) {
+        perf_p_eval_result_us += perf_layer_result_us;
+    }
+
+    perf_layer_timing_reset_current();
+}
+
+void llama_context::perf_layer_timing_reset_current() {
+    perf_layer_timing_active = false;
+    perf_layer_graph_n_tokens = 0;
+    perf_layer_graph_is_encode = false;
+    perf_layer_graph_start_us = 0;
+    perf_layer_last_us = 0;
+    perf_layer_result_us = 0;
+    std::fill(perf_layer_curr_us.begin(), perf_layer_curr_us.end(), 0);
+}
+
+void llama_context::perf_layer_timing_print() const {
+    if (!perf_layer_timing_enabled) {
+        return;
+    }
+
+    static const char * log_tag = "llama_perf_context_print";
+
+    auto print_group = [&](const char * label, const std::vector<int64_t> & layer_us, int64_t result_us, double total_ms) {
+        int64_t sum_us = result_us;
+        for (const auto us : layer_us) {
+            sum_us += us;
+        }
+
+        if (sum_us == 0) {
+            return;
+        }
+
+        LLAMA_LOG_INFO("%s: %s layer timing:\n", log_tag, label);
+        for (size_t i = 0; i < layer_us.size(); ++i) {
+            LLAMA_LOG_INFO("%s:   layer %3zu = %10.2f ms\n", log_tag, i, 1e-3 * layer_us[i]);
+        }
+        LLAMA_LOG_INFO("%s:   result    = %10.2f ms\n", log_tag, 1e-3 * result_us);
+        LLAMA_LOG_INFO("%s:   observed  = %10.2f ms\n", log_tag, 1e-3 * sum_us);
+        LLAMA_LOG_INFO("%s:   overhead  = %10.2f ms\n", log_tag, std::max(0.0, total_ms - 1e-3 * sum_us));
+    };
+
+    print_group("prompt encode", perf_p_encode_layer_us, perf_p_encode_result_us, 1e-3 * t_p_encode_us);
+    print_group("prompt eval", perf_p_eval_layer_us, perf_p_eval_result_us, 1e-3 * t_p_eval_us);
+    print_group("eval", perf_eval_layer_us, perf_eval_result_us, 1e-3 * t_eval_us);
 }
 
 //
@@ -2618,18 +2854,35 @@ llama_perf_context_data llama_context::perf_get_data() const {
     data.t_load_ms   = 1e-3 * t_load_us;
     data.t_p_eval_ms = 1e-3 * t_p_eval_us;
     data.t_eval_ms   = 1e-3 * t_eval_us;
-    data.n_p_eval    = std::max(1, n_p_eval);
-    data.n_eval      = std::max(1, n_eval);
+    data.n_p_eval    = std::max(0, n_p_eval);
+    data.n_eval      = std::max(0, n_eval);
     data.n_reused    = std::max(0, n_reused);
 
     return data;
 }
 
+int64_t llama_context::perf_get_prompt_encode_us() const {
+    return t_p_encode_us;
+}
+
+int32_t llama_context::perf_get_prompt_encode_tokens() const {
+    return n_p_encode;
+}
+
 void llama_context::perf_reset() {
     t_start_us  = ggml_time_us();
+    t_p_encode_us = n_p_encode = 0;
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+    perf_p_encode_result_us = 0;
+    perf_p_eval_result_us = 0;
+    perf_eval_result_us   = 0;
+    std::fill(perf_p_encode_layer_us.begin(), perf_p_encode_layer_us.end(), 0);
+    std::fill(perf_p_eval_layer_us.begin(), perf_p_eval_layer_us.end(), 0);
+    std::fill(perf_eval_layer_us.begin(), perf_eval_layer_us.end(), 0);
+    perf_current_is_encode = false;
+    perf_layer_timing_reset_current();
 }
 
 std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> llama_context::memory_breakdown() const {
@@ -3458,16 +3711,27 @@ llama_perf_context_data llama_perf_context(const llama_context * ctx) {
 
 void llama_perf_context_print(const llama_context * ctx) {
     const auto data = llama_perf_context(ctx);
+    const auto n_p_encode = ctx->perf_get_prompt_encode_tokens();
+    const auto t_p_encode_us = ctx->perf_get_prompt_encode_us();
 
     const double t_end_ms = 1e-3 * ggml_time_us();
 
     LLAMA_LOG_INFO("%s:        load time = %10.2f ms\n", __func__, data.t_load_ms);
-    LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
-    LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
-            __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
-    LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
+    if (n_p_encode > 0) {
+        LLAMA_LOG_INFO("%s: prompt encode time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
+                __func__, 1e-3 * t_p_encode_us, n_p_encode, 1e-3 * t_p_encode_us / n_p_encode, 1e9 / t_p_encode_us * n_p_encode);
+    }
+    if (data.n_p_eval > 0) {
+        LLAMA_LOG_INFO("%s: prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
+                __func__, data.t_p_eval_ms, data.n_p_eval, data.t_p_eval_ms / data.n_p_eval, 1e3 / data.t_p_eval_ms * data.n_p_eval);
+    }
+    if (data.n_eval > 0) {
+        LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
+                __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
+    }
+    LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (n_p_encode + data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+    ctx->perf_layer_timing_print();
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

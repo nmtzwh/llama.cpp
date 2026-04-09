@@ -313,7 +313,8 @@ json format_embeddings_response_oaicompat(
     const json & request,
     const std::string & model_name,
     const json & embeddings,
-    bool use_base64 = false);
+    bool use_base64 = false,
+    const json & profiling = json());
 
 // TODO: move it to server-task.cpp
 json format_response_rerank(

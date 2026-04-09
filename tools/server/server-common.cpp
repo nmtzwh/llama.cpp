@@ -1659,7 +1659,8 @@ json format_embeddings_response_oaicompat(
         const json & request,
         const std::string & model_name,
         const json & embeddings,
-        bool use_base64) {
+        bool use_base64,
+        const json & profiling) {
     json data = json::array();
     int32_t n_tokens = 0;
     int i = 0;
@@ -1683,6 +1684,9 @@ json format_embeddings_response_oaicompat(
                 {"object", "embedding"}
             };
         }
+        if (elem.contains("profiling")) {
+            embedding_obj["profiling"] = elem.at("profiling");
+        }
         data.push_back(embedding_obj);
 
         n_tokens += json_value(elem, "tokens_evaluated", 0);
@@ -1697,6 +1701,10 @@ json format_embeddings_response_oaicompat(
         }},
         {"data", data}
     };
+
+    if (!profiling.is_null() && !profiling.empty()) {
+        res["profiling"] = profiling;
+    }
 
     return res;
 }

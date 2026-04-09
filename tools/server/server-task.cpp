@@ -642,6 +642,16 @@ json result_prompt_progress::to_json() const {
     };
 }
 
+json result_embedding_profiling::to_json() const {
+    return json {
+        {"tokenization_ms", tokenization_ms},
+        {"queue_wait_ms",   queue_wait_ms},
+        {"transformer_ms",  transformer_ms},
+        {"pooling_ms",      pooling_ms},
+        {"total_ms",        total_ms},
+    };
+}
+
 static inline std::string stop_type_to_str(stop_type type) {
     switch (type) {
         case STOP_TYPE_EOS:   return "eos";
@@ -1799,6 +1809,7 @@ json server_task_result_embd::to_json_non_oaicompat() {
     return json {
         {"index",     index},
         {"embedding", embedding},
+        {"profiling", profiling.to_json()},
     };
 }
 
@@ -1807,6 +1818,7 @@ json server_task_result_embd::to_json_oaicompat() {
         {"index",            index},
         {"embedding",        embedding[0]},
         {"tokens_evaluated", n_tokens},
+        {"profiling",        profiling.to_json()},
     };
 }
 

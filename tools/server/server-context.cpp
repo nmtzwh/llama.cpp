@@ -157,6 +157,7 @@ struct server_slot {
 
     double t_prompt_processing = 0.0; // ms
     double t_token_generation = 0.0;  // ms
+    result_embedding_profiling embedding_profiling;
 
     std::function<void(int /* id_slot */)> callback_on_release;
 
@@ -168,6 +169,10 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        n_prompt_tokens_processed = 0;
+        t_prompt_processing = 0.0;
+        t_token_generation = 0.0;
+        embedding_profiling = {};
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -1543,6 +1548,7 @@ private:
     }
 
     void send_embedding(const server_slot & slot, const llama_batch & batch) {
+        const int64_t t_pooling_start_us = ggml_time_us();
         auto res = std::make_unique<server_task_result_embd>();
         res->id        = slot.task->id;
         res->index     = slot.task->index;
@@ -1583,6 +1589,12 @@ private:
         }
 
         SLT_DBG(slot, "%s", "sending embeddings\n");
+
+        res->profiling = slot.embedding_profiling;
+        res->profiling.pooling_ms = (ggml_time_us() - t_pooling_start_us) / 1e3;
+        if (slot.task->embedding_timing.t_total_start_us > 0) {
+            res->profiling.total_ms = (ggml_time_us() - slot.task->embedding_timing.t_total_start_us) / 1e3;
+        }
 
         queue_results.send(std::move(res));
     }
@@ -2188,6 +2200,11 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
+                        if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING && slot.task->embedding_timing.t_queue_post_us > 0) {
+                            slot.embedding_profiling.tokenization_ms = slot.task->embedding_timing.tokenization_ms;
+                            slot.embedding_profiling.queue_wait_ms =
+                                (slot.t_start_process_prompt - slot.task->embedding_timing.t_queue_post_us) / 1e3;
+                        }
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -2735,9 +2752,30 @@ private:
                 batch.logits   + i,
             };
 
+            const int64_t t_decode_start_us = ggml_time_us();
             const int ret = llama_decode(ctx, batch_view);
+            const double t_decode_ms = (ggml_time_us() - t_decode_start_us) / 1e3;
 
             metrics.on_decoded(slots);
+
+            if (ret == 0 && batch_view.n_tokens > 0) {
+                for (auto & slot : slots) {
+                    if (!slot.task || slot.task->type != SERVER_TASK_TYPE_EMBEDDING) {
+                        continue;
+                    }
+
+                    int n_slot_tokens = 0;
+                    for (int j = 0; j < batch_view.n_tokens; ++j) {
+                        if (batch_view.seq_id[j][0] == slot.id) {
+                            ++n_slot_tokens;
+                        }
+                    }
+
+                    if (n_slot_tokens > 0) {
+                        slot.embedding_profiling.transformer_ms += t_decode_ms * n_slot_tokens / batch_view.n_tokens;
+                    }
+                }
+            }
 
             if (ret != 0) {
                 {
@@ -4137,6 +4175,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(const server_http_req & req, task_response_type res_type) {
+    const int64_t t_request_start_us = ggml_time_us();
     auto res = create_response();
     if (!params.embedding) {
         res->error(format_error_response("This server does not support embeddings. Start it with `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
@@ -4173,7 +4212,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+    std::vector<json> prompt_items;
+    if (prompt.is_array() && !json_is_array_and_contains_numbers(prompt)) {
+        prompt_items.reserve(prompt.size());
+        for (const auto & item : prompt) {
+            prompt_items.push_back(item);
+        }
+    } else {
+        prompt_items.push_back(prompt);
+    }
+
+    std::vector<server_tokens> tokenized_prompts;
+    std::vector<server_task::embedding_timing_state> embedding_timing_states;
+    tokenized_prompts.reserve(prompt_items.size());
+    embedding_timing_states.reserve(prompt_items.size());
+
+    for (const auto & item : prompt_items) {
+        const int64_t t_tokenization_start_us = ggml_time_us();
+        auto tokenized = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, item, true, true);
+        GGML_ASSERT(tokenized.size() == 1);
+
+        embedding_timing_states.push_back(server_task::embedding_timing_state{
+            /* .tokenization_ms = */ (ggml_time_us() - t_tokenization_start_us) / 1e3,
+            /* .t_total_start_us = */ t_tokenization_start_us,
+            /* .t_queue_post_us = */ 0,
+        });
+        tokenized_prompts.push_back(std::move(tokenized[0]));
+    }
+
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {
@@ -4195,14 +4261,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
     auto & rd = res->rd;
     {
         std::vector<server_task> tasks;
+        tasks.reserve(tokenized_prompts.size());
+        const int64_t t_queue_post_us = ggml_time_us();
         for (size_t i = 0; i < tokenized_prompts.size(); i++) {
             server_task task = server_task(SERVER_TASK_TYPE_EMBEDDING);
 
             task.id     = rd.get_new_id();
+            task.index  = i;
             task.tokens = std::move(tokenized_prompts[i]);
+            task.embedding_timing = embedding_timing_states[i];
+            task.embedding_timing.t_queue_post_us = t_queue_post_us;
 
             // OAI-compat
-            task.params.res_type = res_type;
+            task.params.res_type        = res_type;
             task.params.embd_normalize = embd_normalize;
 
             tasks.push_back(std::move(task));
@@ -4226,10 +4297,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
+    json aggregate_ms = {
+        {"tokenization_ms", 0.0},
+        {"queue_wait_ms",   0.0},
+        {"transformer_ms",  0.0},
+        {"pooling_ms",      0.0},
+        {"total_ms",        0.0},
+    };
+    for (const auto & item : responses) {
+        const json & profiling = item.at("profiling");
+        aggregate_ms["tokenization_ms"] = aggregate_ms["tokenization_ms"].get<double>() + json_value(profiling, "tokenization_ms", 0.0);
+        aggregate_ms["queue_wait_ms"]   = aggregate_ms["queue_wait_ms"].get<double>()   + json_value(profiling, "queue_wait_ms",   0.0);
+        aggregate_ms["transformer_ms"]  = aggregate_ms["transformer_ms"].get<double>()  + json_value(profiling, "transformer_ms",  0.0);
+        aggregate_ms["pooling_ms"]      = aggregate_ms["pooling_ms"].get<double>()      + json_value(profiling, "pooling_ms",      0.0);
+        aggregate_ms["total_ms"]        = aggregate_ms["total_ms"].get<double>()        + json_value(profiling, "total_ms",        0.0);
+    }
+
+    json profiling = {
+        {"request_total_ms", (ggml_time_us() - t_request_start_us) / 1e3},
+        {"aggregate_ms",     aggregate_ms},
+    };
+
     // write JSON response
     json root = res_type == TASK_RESPONSE_TYPE_OAI_EMBD
-        ? format_embeddings_response_oaicompat(body, meta->model_name, responses, use_base64)
-        : json(responses);
+        ? format_embeddings_response_oaicompat(body, meta->model_name, responses, use_base64, profiling)
+        : json{
+            {"data",      responses},
+            {"profiling", profiling},
+        };
     res->ok(root);
     return res;
 }

@@ -255,6 +255,12 @@ struct server_task {
     bool is_child() const {
         return id_parent != -1;
     }
+
+    struct embedding_timing_state {
+        double tokenization_ms = 0.0;
+        int64_t t_total_start_us = 0;
+        int64_t t_queue_post_us = 0;
+    } embedding_timing;
 };
 
 struct result_timings {
@@ -282,6 +288,16 @@ struct result_prompt_progress {
     int32_t cache = 0;
     int32_t processed = 0;
     int64_t time_ms = 0;
+
+    json to_json() const;
+};
+
+struct result_embedding_profiling {
+    double tokenization_ms = 0.0;
+    double queue_wait_ms   = 0.0;
+    double transformer_ms  = 0.0;
+    double pooling_ms      = 0.0;
+    double total_ms        = 0.0;
 
     json to_json() const;
 };
@@ -463,6 +479,7 @@ struct server_task_result_embd : server_task_result {
     std::vector<std::vector<float>> embedding;
 
     int32_t n_tokens;
+    result_embedding_profiling profiling;
 
     // response formatting
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;

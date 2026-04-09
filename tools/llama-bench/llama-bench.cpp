@@ -341,6 +341,7 @@ struct cmd_params {
     std::vector<bool>                use_mmap;
     std::vector<bool>                use_direct_io;
     std::vector<bool>                embeddings;
+    std::vector<bool>                embd_clear_memory;
     std::vector<bool>                no_op_offload;
     std::vector<bool>                no_host;
     std::vector<size_t>              fit_params_target;
@@ -386,6 +387,7 @@ static const cmd_params cmd_params_defaults = {
     /* use_mmap             */ { true },
     /* use_direct_io        */ { false },
     /* embeddings           */ { false },
+    /* embd_clear_memory    */ { false },
     /* no_op_offload        */ { false },
     /* no_host              */ { false },
     /* fit_params_target    */ { 0 },
@@ -456,6 +458,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mmp, --mmap <0|1>                          (default: %s)\n", join(cmd_params_defaults.use_mmap, ",").c_str());
     printf("  -dio, --direct-io <0|1>                     (default: %s)\n", join(cmd_params_defaults.use_direct_io, ",").c_str());
     printf("  -embd, --embeddings <0|1>                   (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
+    printf("  --embd-clear-memory <0|1>                   fully clear memory before embedding prompt runs (default: %s)\n", join(cmd_params_defaults.embd_clear_memory, ",").c_str());
+    printf("                                              use with -embd 1 to better match examples/embedding\n");
     printf("  -ts, --tensor-split <ts0/ts1/..>            (default: 0)\n");
     printf("  -ot --override-tensor <tensor name pattern>=<buffer type>;...\n");
     printf("                                              (default: disabled)\n");
@@ -820,6 +824,13 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.embeddings.insert(params.embeddings.end(), p.begin(), p.end());
+            } else if (arg == "--embd-clear-memory") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.embd_clear_memory.insert(params.embd_clear_memory.end(), p.begin(), p.end());
             } else if (arg == "-nopo" || arg == "--no-op-offload") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1094,6 +1105,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.embeddings.empty()) {
         params.embeddings = cmd_params_defaults.embeddings;
     }
+    if (params.embd_clear_memory.empty()) {
+        params.embd_clear_memory = cmd_params_defaults.embd_clear_memory;
+    }
     if (params.no_op_offload.empty()) {
         params.no_op_offload = cmd_params_defaults.no_op_offload;
     }
@@ -1148,6 +1162,7 @@ struct cmd_params_instance {
     bool               use_mmap;
     bool               use_direct_io;
     bool               embeddings;
+    bool               embd_clear_memory;
     bool               no_op_offload;
     bool               no_host;
     size_t             fit_target;
@@ -1253,6 +1268,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & dio : params.use_direct_io)
     for (const auto & noh : params.no_host)
     for (const auto & embd : params.embeddings)
+    for (const auto & eclr : params.embd_clear_memory)
     for (const auto & nopo : params.no_op_offload)
     for (const auto & nb : params.n_batch)
     for (const auto & nub : params.n_ubatch)
@@ -1295,6 +1311,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
+                /* .embd_clear_memory = */ eclr,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
@@ -1333,6 +1350,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
+                /* .embd_clear_memory = */ eclr,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
@@ -1371,6 +1389,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .use_mmap     = */ mmp,
                 /* .use_direct_io= */ dio,
                 /* .embeddings   = */ embd,
+                /* .embd_clear_memory = */ eclr,
                 /* .no_op_offload= */ nopo,
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
@@ -1414,6 +1433,7 @@ struct test {
     bool                     use_mmap;
     bool                     use_direct_io;
     bool                     embeddings;
+    bool                     embd_clear_memory;
     bool                     no_op_offload;
     bool                     no_host;
     size_t                   fit_target;
@@ -1455,6 +1475,7 @@ struct test {
         use_mmap       = inst.use_mmap;
         use_direct_io  = inst.use_direct_io;
         embeddings     = inst.embeddings;
+        embd_clear_memory = inst.embd_clear_memory;
         no_op_offload  = inst.no_op_offload;
         no_host        = inst.no_host;
         fit_target     = inst.fit_target;
@@ -1516,6 +1537,7 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "use_mmap",      "use_direct_io",  "embeddings",
+            "embd_clear_memory",
             "no_op_offload",  "no_host",        "fit_target",     "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1534,7 +1556,7 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" || field == "flash_attn" ||
-            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "no_host") {
+            field == "use_mmap" || field == "use_direct_io" || field == "embeddings" || field == "embd_clear_memory" || field == "no_host") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1610,6 +1632,7 @@ struct test {
                                             std::to_string(use_mmap),
                                             std::to_string(use_direct_io),
                                             std::to_string(embeddings),
+                                            std::to_string(embd_clear_memory),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
                                             std::to_string(fit_target),
@@ -1845,6 +1868,9 @@ struct markdown_printer : public printer {
         if (field == "embeddings") {
             return "embd";
         }
+        if (field == "embd_clear_memory") {
+            return "eclr";
+        }
         if (field == "no_op_offload") {
             return "nopo";
         }
@@ -1943,6 +1969,9 @@ struct markdown_printer : public printer {
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
+        }
+        if (params.embd_clear_memory.size() > 1 || params.embd_clear_memory != cmd_params_defaults.embd_clear_memory) {
+            fields.emplace_back("embd_clear_memory");
         }
         if (params.no_op_offload.size() > 1 || params.no_op_offload != cmd_params_defaults.no_op_offload) {
             fields.emplace_back("no_op_offload");
@@ -2101,12 +2130,69 @@ static std::vector<llama_token> build_text_prompt_tokens(llama_context * ctx, co
     return tokens;
 }
 
+static bool test_prompt_embd(
+        llama_context * ctx,
+        int n_prompt,
+        int n_batch,
+        int n_threads,
+        const std::vector<llama_token> * prompt_tokens,
+        bool embd_clear_memory) {
+    llama_set_n_threads(ctx, n_threads, n_threads);
+
+    const llama_model * model   = llama_get_model(ctx);
+    const llama_vocab * vocab   = llama_model_get_vocab(model);
+    const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
+    std::vector<llama_token> tokens = prompt_tokens ? *prompt_tokens : std::vector<llama_token>(n_prompt);
+    if (prompt_tokens == nullptr) {
+        tokens[0] = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+        for (int i = 1; i < n_prompt; ++i) {
+            tokens[i] = std::rand() % n_vocab;
+        }
+    }
+
+    if (embd_clear_memory) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+    }
+
+    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
+
+    int n_processed = 0;
+    while (n_processed < n_prompt) {
+        common_batch_clear(batch);
+
+        const int n_tokens = std::min(n_prompt - n_processed, n_batch);
+        for (int i = 0; i < n_tokens; ++i) {
+            common_batch_add(batch, tokens[n_processed + i], n_processed + i, { 0 }, true);
+        }
+
+        const int res = llama_decode(ctx, batch);
+        if (res != 0) {
+            fprintf(stderr, "%s: failed to decode embedding-style prompt batch, res = %d\n", __func__, res);
+            llama_batch_free(batch);
+            return false;
+        }
+
+        n_processed += n_tokens;
+    }
+
+    llama_synchronize(ctx);
+    llama_batch_free(batch);
+    return true;
+}
+
 static bool test_prompt(
         llama_context * ctx,
         int n_prompt,
         int n_batch,
         int n_threads,
+        bool embeddings,
+        bool embd_clear_memory,
         const std::vector<llama_token> * prompt_tokens = nullptr) {
+    if (embeddings) {
+        return test_prompt_embd(ctx, n_prompt, n_batch, n_threads, prompt_tokens, embd_clear_memory);
+    }
+
     llama_set_n_threads(ctx, n_threads, n_threads);
 
     const llama_model * model   = llama_get_model(ctx);
@@ -2328,7 +2414,8 @@ int main(int argc, char ** argv) {
             return &it->second;
         };
 
-        llama_memory_clear(llama_get_memory(ctx), false);
+        const bool full_memory_clear = inst.embeddings && inst.embd_clear_memory;
+        llama_memory_clear(llama_get_memory(ctx), full_memory_clear);
 
         // cool off before the test
         if (params.delay) {
@@ -2362,8 +2449,7 @@ int main(int argc, char ** argv) {
                 if (params.progress) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                 }
-                //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, get_prompt_tokens(t.n_prompt));
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, t.embeddings, t.embd_clear_memory, get_prompt_tokens(t.n_prompt));
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                     llama_free(ctx);
@@ -2386,7 +2472,7 @@ int main(int argc, char ** argv) {
         }
 
         for (int i = 0; i < params.reps; i++) {
-            llama_memory_clear(llama_get_memory(ctx), false);
+            llama_memory_clear(llama_get_memory(ctx), full_memory_clear);
 
             if (t.n_depth > 0) {
                 bool is_cached = t.n_depth == cstate.depth;
@@ -2405,7 +2491,7 @@ int main(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads, get_prompt_tokens(t.n_depth));
+                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads, t.embeddings, t.embd_clear_memory, get_prompt_tokens(t.n_depth));
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                         llama_free(ctx);
@@ -2432,7 +2518,7 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                             i + 1, params.reps);
                 }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, get_prompt_tokens(t.n_prompt));
+                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads, t.embeddings, t.embd_clear_memory, get_prompt_tokens(t.n_prompt));
                 if (!res) {
                     fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                     llama_free(ctx);

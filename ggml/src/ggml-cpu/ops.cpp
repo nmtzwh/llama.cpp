@@ -8870,7 +8870,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                                 k->type == v->type &&
                                 neq1 >= Q_TILE_SZ);
 #ifdef GGML_SIMD
+#ifndef __ARM_FEATURE_SVE
         use_tiled &= (DV % GGML_F32_EPR == 0);
+#endif
 #endif
         int current_chunk = ith;
 
